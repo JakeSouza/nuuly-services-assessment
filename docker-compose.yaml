@@ -8,7 +8,7 @@ services:
             POSTGRES_USER: inventory_user
             POSTGRES_PASSWORD: inventory_password
     kafka:
-        image: confluentinc/cp-enterprise-kafka:6.2.0
+        image: confluentinc/cp-kafka:7.6.0
         depends_on:
             - zookeeper
         ports:
@@ -27,7 +27,7 @@ services:
         volumes:
             - ./data:/data
     zookeeper:
-        image: confluentinc/cp-zookeeper:6.2.0
+        image: confluentinc/cp-zookeeper:7.6.0
         ports:
             - "32181:32181"
         environment:
