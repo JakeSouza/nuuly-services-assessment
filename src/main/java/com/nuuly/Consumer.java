@@ -2,6 +2,7 @@ package com.nuuly;
 
 import java.util.Optional;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -18,7 +19,9 @@ public class Consumer {
 
     Logger logger = LoggerFactory.getLogger(this.getClass());
 
-    final String INVENTORY_TOPIC = "inventory_updates";
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    private static final String INVENTORY_TOPIC = "inventory_updates";
 
     @Autowired
     private FavoritesRepository favoritesRepository;
@@ -28,7 +31,13 @@ public class Consumer {
         logger.info("Received message: " + content.toString());
         logger.info(String.format("Received message for SKU %s with amount %s", content.key(), content.value()));
         String sku = content.key();
-        int amount = Integer.parseInt(content.value());
+        int amount;
+        try {
+            amount = objectMapper.readValue(content.value(), Integer.class);
+        } catch (Exception e) {
+            logger.error("Failed to parse purchased amount from Kafka message", e);
+            return; // skip processing invalid message
+        }
         int totalAmount = 0;
 
         // Check if the SKU being purchased is already in our favorites

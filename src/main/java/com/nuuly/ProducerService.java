@@ -1,5 +1,7 @@
 package com.nuuly;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -17,6 +19,7 @@ import org.springframework.stereotype.Service;
  */
 @Service
 public class ProducerService {
+    Logger logger = LoggerFactory.getLogger(this.getClass());
     private final KafkaProducerService<String> kafkaProducerService;
 
     final String INVENTORY_TOPIC = "inventory_updates";
@@ -27,6 +30,7 @@ public class ProducerService {
     }
 
     public void sendInventoryMessage(String key, String message) throws Exception {
+        logger.info(String.format("Sending message to Kafka topic %s with key %s and value %s", INVENTORY_TOPIC, key, message));
         kafkaProducerService.sendMessage(INVENTORY_TOPIC, key, message);
     }
 }
