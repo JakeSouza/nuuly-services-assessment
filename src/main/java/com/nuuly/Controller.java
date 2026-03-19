@@ -11,7 +11,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import static org.springframework.http.HttpStatus.*;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -92,31 +91,18 @@ public class Controller {
             @RequestParam("sku") String sku,
             @RequestParam("amount") int amount
     ) {
-        // Functionality purely for Favorites calculations  - to be moved to kafka consumer
-        int totalAmount = 0;
-
-        // Check if the SKU being purchased is already in our favorites
-        Optional<Favorites> favorite = favoritesRepository.findById(sku);
-
-        // If the SKU being purchased is already in our favorites, increment the count by the amount being purchased.
-        if (favorite.isPresent()) {
-            logger.info("Item already in favorites, incrementing count");
-            Favorites currentFavorite = favorite.get();
-            currentFavorite.setCount(currentFavorite.getCount() + amount);
-            favoritesRepository.save(currentFavorite);
-        }
-        else {
-            logger.info("Newly purchased item, adding to favorites");
-            totalAmount = amount;
-            favoritesRepository.save(new Favorites(sku, amount));
-        }
-
-        // Log the purchase for our own records
-        String tmpMessage = String.format("Successfully added %s of SKU %s to our favorites for a total of %d", amount, sku, totalAmount);
-        logger.info(tmpMessage);
-
-        // PURCHASE ORDER FUNCTIONALITY
         logger.info(String.format("Received purchase order for %d of SKU %s", amount, sku));
+        // Call Kafka producer to async fill favorites table
+        try {
+            logger.info("Sending purchase message to Kafka to update favorites");
+            producer.sendInventoryMessage(sku, Integer.toString(amount));
+        } catch (Exception e) {
+            // Log and handle failure
+            logger.error("Failed to send Kafka message", e);
+            // Functionality to retry with back off and then send to DLQ if we exhaust our retries would go here
+            // Would not want failure point here to cause purchase failure. Better to fix pipeline to favorites than to fail purchase order
+        }
+
         String returnMsg;
         // Check if we have inventory for the SKU being purchased
         Optional<Inventory> inventory = inventoryRepository.findById(sku);
@@ -159,6 +145,7 @@ public class Controller {
         @RequestParam("count") int count
     ) {
         logger.info(String.format("Received request for the %s popular %d items", filter, count));
+        // If the filter is "most", return the most popular items. If the filter is "least", return the least popular items. If the filter is anything else, return an error message.
         if(filter.equals("most")) {
             List<Favorites> favorites = favoritesRepository.findAllByOrderByCountDesc();
             logger.info("Here are the most popular items:");
@@ -169,6 +156,12 @@ public class Controller {
             List<Favorites> favorites = favoritesRepository.findAllByOrderByCountAsc();
             logger.info("Here are the least popular items:");
             logger.info(favorites.toString());
+
+            // If the count requested is greater than the number of items in our favorites, return all of the items in our favorites.
+            if(count > favorites.size()) {
+                count = favorites.size();
+            }
+
             List<Favorites> requestFavorites = favorites.subList(0, count);
             return new ResponseEntity<>(requestFavorites.toString(), OK);
         }       
