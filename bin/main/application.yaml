@@ -1,0 +1,16 @@
+spring:
+  sql:
+    init:
+      mode: always
+  datasource:
+    url: jdbc:postgresql://postgres:5432/inventory_db?user=inventory_user&password=inventory_password
+  jpa:
+    hibernate:
+      ddl-auto: create
+  kafka:
+    bootstrap-servers: kafka:9092
+    consumer:
+      group-id: inventory-group
+    producer:
+      acks: all
+      retries: 3

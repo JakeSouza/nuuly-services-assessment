@@ -27,5 +27,13 @@ public class Inventory {
                 sku, count
         );
     }
+    
+    public int getCount() {
+        return count;
+    }
+
+    public void setCount(int i) {
+        this.count = i;
+    }
 }
 

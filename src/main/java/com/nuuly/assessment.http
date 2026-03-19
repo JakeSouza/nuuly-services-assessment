@@ -1,1 +1,1 @@
-POST localhost:8080/create?sku=123&receiptAmount=5
+POST "https://localhost:8080/create?sku=123&receiptAmount=5"
