@@ -35,5 +35,9 @@ public class Inventory {
     public void setCount(int i) {
         this.count = i;
     }
+
+    public String getSku() {
+        return sku;
+    }
 }
 

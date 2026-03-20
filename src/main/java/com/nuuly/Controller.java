@@ -8,7 +8,6 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.client.HttpClientErrorException.BadRequest;
 
 import static org.springframework.http.HttpStatus.*;
 
@@ -53,49 +52,93 @@ public class Controller {
             @RequestParam("sku") String sku,
             @RequestParam("receiptAmount") int receiptAmount
     ) {
-        logger.info(String.format("Received create order for %d of SKU %s", receiptAmount, sku));
-        String returnMsg;
-        int totalAmount = 0;
+        logger.info("Received create order for {} of SKU {}", receiptAmount, sku);
 
-        // Check if we already have inventory for the SKU being added
-        Optional<Inventory> inventory = inventoryRepository.findById(sku);
+        try {
+            // Update inventory 
+            int finalInventory = updateInventory(sku, receiptAmount);
+            String msg = String.format("Successfully added %d of SKU %s to inventory for total of %d)", receiptAmount, sku, finalInventory);
+            logger.info(msg);
+            // Return success message
+            return new ResponseEntity<>(msg, CREATED);
+        } catch (RuntimeException e) {
+            // Log and handle error
+            String errorMsg = String.format("Failed to create inventory for SKU %s with amount %d", sku, receiptAmount);
+            logger.error(errorMsg, e);
+            return new ResponseEntity<>(errorMsg, INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    /**
+     * Helper method to update inventory when we receive a purchase order in table
+     * 
+     * @param sku: The stock keeping unit as alphanumeric digits assigned to a product
+     * @param receiptAmount: The number of SKUs that are received by this purchase order
+     * @return The total amount of inventory for the SKU after the update
+     */
+    protected int updateInventory(String sku, int receiptAmount) {
+        // Try to fetch existing inventory for the SKU
+        Optional<Inventory> existingInventory = inventoryRepository.findById(sku);
         
-        // If we do, increment the inventory by the amount being added. If we don't, create a new inventory record for that SKU with the amount being added.
-        if (inventory.isPresent()) {
-            logger.info("We already have inventory for this SKU, adding to the current inventory");
-            Inventory currentInventory = inventory.get();
-            totalAmount = currentInventory.getCount() + receiptAmount;
-            currentInventory.setCount(totalAmount);
-            inventoryRepository.save(currentInventory);
-        }
-        else {
-            logger.info("New SKU, adding to inventory");
-            totalAmount = receiptAmount;
-            inventoryRepository.save(new Inventory(sku, receiptAmount));
+        // If existing we update the value
+        if (existingInventory.isPresent()) {
+            Inventory inventory = existingInventory.get();
+            int updatedAmount = inventory.getCount() + receiptAmount;
+            inventory.setCount(updatedAmount);
+            inventoryRepository.save(inventory);
+            return updatedAmount;
         }
 
-        // Log the purchase order for our own records and return a success message
-        returnMsg = String.format("Successfully added %s of SKU %s to our inventory for a total of %d", receiptAmount, sku, totalAmount);
-        logger.info(returnMsg);
-        return new ResponseEntity<>(returnMsg, CREATED);
+        // Else create a new record
+        Inventory newInventory = new Inventory(sku, receiptAmount);
+        inventoryRepository.save(newInventory);
+        return receiptAmount;
     }
 
     /**
      * When a garment is actually purchased by us, we want to decrement the inventory to represent that the item was
      * purchased.
      *
-     * @param sku: The item that was purchased
-     * @param amount: How many of that item that was purchased
-     * @return That the purchase was successful
+     * @param skus   List of SKUs to purchase
+     * @param amounts List of quantities for each SKU
+     * @return That the purchase was successful (or partially successful)
      */
     @PostMapping("/purchase")
     public ResponseEntity<?> purchase(
             @RequestParam("skus") List<String> skus,
             @RequestParam("amounts") List<Integer> amounts
     ) {
-        // Avoid String.format conversion bugs (amounts is a List<String> when formatted).
         logger.info("Received purchase order for {} of SKU {}", amounts, skus);
+
+        // Ensure we have valid input lists
+        if (skus == null || amounts == null || skus.size() != amounts.size()) {
+            String errorMsg = "Skus and amounts must be the same length and not null";
+            logger.warn(errorMsg);
+            return new ResponseEntity<>(errorMsg, BAD_REQUEST);
+        }
+
         // Call Kafka producer to async fill favorites table
+        publishFavorites(skus, amounts);
+
+        List<String> successSkus = new ArrayList<>();
+        List<String> failedSkus = new ArrayList<>();
+
+        // Process each purchase from the list
+        for (int i = 0; i < skus.size(); i++) {
+            processSinglePurchase(skus.get(i), amounts.get(i), successSkus, failedSkus);
+        }
+        
+        // Send response to user based on success
+        return makePurchaseResponse(successSkus, failedSkus);
+    }
+
+    /**
+     * Publishes purchase messages to Kafka to update favorites table
+     *
+     * @param skus: List of SKUs being purchased
+     * @param amounts: List of amounts being purchased for each SKU, must be the same
+    */
+    protected void publishFavorites(List<String> skus, List<Integer> amounts) {
         try {
             logger.info("Sending purchase messages to Kafka to update favorites");
             for (int i = 0; i < skus.size(); i++) {
@@ -107,60 +150,79 @@ public class Controller {
             // Functionality to retry with back off and then send to DLQ would go here
             // No failure here, need to process purchase regardless of favorites functionality
         }
+    }
 
-        List<String> successMessages = new ArrayList<>();
-        List<String> errorMessages = new ArrayList<>();
-        for (int i = 0; i < skus.size(); i++) {
-            String sku = skus.get(i);
-            int amount = amounts.get(i);
-            // Check if we have inventory for the SKU being purchased
-            Optional<Inventory> inventory = inventoryRepository.findById(sku);
-
-            // If we have inventory for the SKU being purchased, check if we have enough inventory to fulfill the order. If we do, decrement the inventory by the amount purchased and return a success message. If we don't, return an error message.
-            if (inventory.isPresent()) {
-                logger.info("We have inventory for this SKU, checking if we have enough to fulfill the order");
-                Inventory currentInventory = inventory.get();
-
-                // If we don't have enough inventory to fulfill the order, return an error message
-                if(currentInventory.getCount() < amount) {
-                    logger.info(String.format("Not enough inventory for SKU %s. Current inventory: %d, requested amount: %d", sku, currentInventory.getCount(), amount));
-                    errorMessages.add(sku);
-                    continue; // skip to the next item being purchased
-                }
-
-                // We have enough inventory to fulfill the order, decrement the inventory by the amount purchased and return a success message
+    /**
+     * Processes individual purchases to update inventory numbers based on purchased items
+     * and tracks successful and failed purchases for future response to user
+     * 
+     * @param sku: The stock keeping unit as alphanumeric digits assigned to a product
+     * @param amount: The number of SKUs being purchased
+     * @param successSkus: List to track successful purchases
+     * @param failedSkus: List to track failed purchases
+     */
+    protected void processSinglePurchase(
+            String sku,
+            int amount,
+            List<String> successSkus,
+            List<String> failedSkus
+    ) {
+        Optional<Inventory> inventoryOpt = inventoryRepository.findById(sku);
+        
+        // If we have inventory for this SKU already 
+        if (inventoryOpt.isPresent()) {
+            logger.info("We have inventory for this SKU, checking if we have enough to fulfill the order");
+            Inventory currentInventory = inventoryOpt.get();
+            
+            // Check if  we have enough inventory to fufill order
+            if (currentInventory.getCount() < amount) {
+                // If we don't, log and track failed purchase
+                logger.info(String.format("Not enough inventory for SKU %s. Current inventory: %d, requested amount: %d", sku, currentInventory.getCount(), amount));
+                failedSkus.add(sku);
+            } else {
+                // If we do, decrement inventory and track successful purchase
                 currentInventory.setCount(currentInventory.getCount() - amount);
                 inventoryRepository.save(currentInventory);
-                successMessages.add(sku);
+                successSkus.add(sku);
                 logger.info(String.format("Successfully purchased %d of SKU %s", amount, sku));
-                
             }
-            else{
-                // If we don't have any inventory for the SKU being purchased, return an error message
-                logger.info(String.format("We don't have any records for SKU %s, please check the SKU and try again", sku));
-                errorMessages.add(sku);
-            }
+        } else {
+            // If we don't have any inventory for the SKU being purchased, return an error message
+            logger.info(String.format("We don't have any records for SKU %s, please check the SKU and try again", sku));
+            failedSkus.add(sku);
         }
+    }
 
-        if (errorMessages.isEmpty()) {
-            String returnMsg = String.format("Successfully purchased the following items: %s.", successMessages.toString());
+    /**
+     * Helper method to create purchase response message based on which SKUs were successfully purchased and which were not
+     * @param successSkus: List of SKUs that were successfully purchased
+     * @param failedSkus: List of SKUs that were not successfully purchased
+     * @return ResponseEntity with appropriate message and status code based on which SKUs were successfully purchased and which were not
+     */
+    protected ResponseEntity<String> makePurchaseResponse(List<String> successSkus, List<String> failedSkus) {
+        // If all purchases were successful
+        if (failedSkus.isEmpty()) {
+            String returnMsg = String.format("Successfully purchased the following items: %s.", successSkus);
             return new ResponseEntity<>(returnMsg, OK);
+        }
+        // If all purchases were unsuccessful 
+        else if (successSkus.isEmpty()) {
+            String returnMsg = String.format("Could not purchase any of the items requested due to insufficient inventory or invalid SKU: %s.", failedSkus);
+            return new ResponseEntity<>(returnMsg, BAD_REQUEST);
         } 
-        else if(successMessages.isEmpty()) {
-            String returnMsg = String.format("Could not purchase any of the items requested due to insufficient inventory or invalid SKU: %s.", errorMessages.toString());
-            return new ResponseEntity<>(returnMsg, BAD_REQUEST);
-        }
+        // Mixed success and failure case
         else {
-            String returnMsg = String.format("Successfully purchased the following items: %s. Could not purchased following iteems due to insufficient inventory or invalid SKU: %s.", successMessages.toString(), errorMessages.toString());
+            String returnMsg = String.format("Successfully purchased the following items: %s. Could not purchase the following items due to insufficient inventory or invalid SKU: %s.", successSkus, failedSkus);
             return new ResponseEntity<>(returnMsg, BAD_REQUEST);
         }
-        
     }
 
     /**
      * From a business perspective, we want to understand what our customers like and don't like. We want to get a list
      * of favorite items ranked by how many were purchased.
      *
+     * @param filter most|least
+     * @param count  number of items to return
      * @return A list of favorite items
      */
     @GetMapping("/favorites")
@@ -169,31 +231,28 @@ public class Controller {
         @RequestParam("count") int count
     ) {
         logger.info(String.format("Received request for the %s popular %d items", filter, count));
-        // If the filter is "most", return the most popular items. If the filter is "least", return the least popular items. If the filter is anything else, return an error message.
+        List<Favorites> favorites = new ArrayList<>();
+        // If the filter is "most", return the most popular items.
         if(filter.equals("most")) {
-            List<Favorites> favorites = favoritesRepository.findAllByOrderByCountDesc();
-            logger.info("Here are the most popular items:");
-            logger.info(favorites.toString());
-
-            if(count > favorites.size()) {
-                count = favorites.size();
-            }
-
-            List<Favorites> requestFavorites = favorites.subList(0, count);
-            return new ResponseEntity<>(requestFavorites.toString(), OK);
+            favorites = favoritesRepository.findAllByOrderByCountDesc();
         }
+        // If the filter is "least", return the least popular items. 
         else if(filter.equals("least")) {
-            List<Favorites> favorites = favoritesRepository.findAllByOrderByCountAsc();
-            logger.info("Here are the least popular items:");
-            logger.info(favorites.toString());
+            favorites = favoritesRepository.findAllByOrderByCountAsc();
+        } 
+        // If the filter is anything else, return an error message.
+        else {
+            return new ResponseEntity<>("To get the most popular items, use filter=most. To get the least popular items, use filter=least, please try again.", BAD_REQUEST);
+        }
+        logger.info(String.format("Getting the %s popular %d items:", filter, count));
 
-            if(count > favorites.size()) {
-                count = favorites.size();
-            }
+        // if requesting more items than in favorites table, return all items in favorites table
+        if(count > favorites.size()) {
+            count = favorites.size();
+        }
 
-            List<Favorites> requestFavorites = favorites.subList(0, count);
-            return new ResponseEntity<>(requestFavorites.toString(), OK);
-        }       
-        return new ResponseEntity<>("To get the most popular items, use filter=most. To get the least popular items, use filter=least, please try again.", BAD_REQUEST);
+        // Return the requested number of items based on filter
+        List<Favorites> requestFavorites = favorites.subList(0, count);
+        return new ResponseEntity<>(requestFavorites.toString(), OK); 
     }
 }
