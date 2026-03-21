@@ -24,11 +24,21 @@ public class ProducerService {
 
     final String INVENTORY_TOPIC = "inventory_updates";
 
+    /**
+     * Constructor for ProducerService
+     * @param kafkaProducerService The KafkaProducerService to be used for sending messages to Kafka topics
+     */
     @Autowired
     public ProducerService(KafkaProducerService<String> kafkaProducerService) {
         this.kafkaProducerService = kafkaProducerService;
     }
 
+    /**
+     * Sends a message to the inventory_updates topic with the given key and message 
+     * @param key The key for the message, which can be used for partitioning in Kafka
+     * @param message The message to be sent, which should be a string representation of the inventory update
+     * @throws Exception if there is an error while sending the message to Kafka
+     */
     public void sendInventoryMessage(String key, String message) throws Exception {
         logger.info(String.format("Sending message to Kafka topic %s with key %s and value %s", INVENTORY_TOPIC, key, message));
         kafkaProducerService.sendMessage(INVENTORY_TOPIC, key, message);

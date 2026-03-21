@@ -36,6 +36,10 @@ public class Controller {
     @Autowired
     private FavoritesRepository favoritesRepository;
 
+    /**
+     * Constructor for the Controller class.
+     * @param producer The ProducerService instance to use for sending messages to Kafka.
+     */
     @Autowired
     public Controller(ProducerService producer) {
         this.producer = producer;
@@ -171,8 +175,8 @@ public class Controller {
      * 
      * @param sku: The stock keeping unit as alphanumeric digits assigned to a product
      * @param amount: The number of SKUs being purchased
-     * @param successSkus: Map to track successful purchases
-     * @param failedSkus: Map to track failed purchases
+     * @param successSkus: Map to track successful purchases and how much was purchased for each SKU
+     * @param notEnoughSkus: Map to track failed purchasees due to not enough inventory, along with how much inventory is left
      * @param missingSkus: List to track SKUs that were not found in inventory
      */
     protected void processSinglePurchase(

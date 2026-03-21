@@ -67,7 +67,7 @@ public class Consumer {
     /**
      * Helper method to parse the amount being purchased from the Kafka message content
      * 
-     * @param content
+     * @param content Kafka ConsumerRecord containing the message with the amount being purchased as the value
      * @return the amount being purchased as an integer, or -1 if there is an error parsing the amount
      */
     protected int parsePurchasedAmount(ConsumerRecord<String, String> content) {
