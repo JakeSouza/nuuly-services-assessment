@@ -34,4 +34,8 @@ public class Favorites {
     public void setCount(int i) {
         this.count = i;
     }
+
+    public String getSku() {
+        return sku;
+    }
 }

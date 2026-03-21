@@ -12,7 +12,9 @@ import org.springframework.web.bind.annotation.RestController;
 import static org.springframework.http.HttpStatus.*;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -57,7 +59,7 @@ public class Controller {
         try {
             // Update inventory 
             int finalInventory = updateInventory(sku, receiptAmount);
-            String msg = String.format("Successfully added %d of SKU %s to inventory for total of %d)", receiptAmount, sku, finalInventory);
+            String msg = String.format("Successfully added %d of SKU %s to inventory for total of %d", receiptAmount, sku, finalInventory);
             logger.info(msg);
             // Return success message
             return new ResponseEntity<>(msg, CREATED);
@@ -117,19 +119,30 @@ public class Controller {
             return new ResponseEntity<>(errorMsg, BAD_REQUEST);
         }
 
-        // Call Kafka producer to async fill favorites table
+        /* Call Kafka producer to async fill favorites table
+        * I do this bnefore fufilling the purchase since the item was desired to be purchased
+        * regardless of whether we have inventory to fufill the purchase or not, therefore still a top prospect
+        */
         publishFavorites(skus, amounts);
 
-        List<String> successSkus = new ArrayList<>();
-        List<String> failedSkus = new ArrayList<>();
+        Map<String, Integer> successSkus = new HashMap<>();
+        Map<String, Integer> failedSkus = new HashMap<>();
+        List<String> missingSkus = new ArrayList<>();
 
         // Process each purchase from the list
         for (int i = 0; i < skus.size(); i++) {
-            processSinglePurchase(skus.get(i), amounts.get(i), successSkus, failedSkus);
+            try {
+                processSinglePurchase(skus.get(i), amounts.get(i), successSkus, failedSkus, missingSkus);
+            } catch (Exception e) {
+                String errorMsg = String.format("Failed to process purchase, please try again later");
+                logger.error(errorMsg, e);
+                return new ResponseEntity<>(errorMsg, INTERNAL_SERVER_ERROR);
+            }
+           
         }
         
         // Send response to user based on success
-        return makePurchaseResponse(successSkus, failedSkus);
+        return makePurchaseResponse(successSkus, failedSkus, missingSkus);
     }
 
     /**
@@ -158,14 +171,16 @@ public class Controller {
      * 
      * @param sku: The stock keeping unit as alphanumeric digits assigned to a product
      * @param amount: The number of SKUs being purchased
-     * @param successSkus: List to track successful purchases
-     * @param failedSkus: List to track failed purchases
+     * @param successSkus: Map to track successful purchases
+     * @param failedSkus: Map to track failed purchases
+     * @param missingSkus: List to track SKUs that were not found in inventory
      */
     protected void processSinglePurchase(
             String sku,
             int amount,
-            List<String> successSkus,
-            List<String> failedSkus
+            Map<String, Integer> successSkus,
+            Map<String, Integer> notEnoughSkus,
+            List<String> missingSkus
     ) {
         Optional<Inventory> inventoryOpt = inventoryRepository.findById(sku);
         
@@ -178,42 +193,70 @@ public class Controller {
             if (currentInventory.getCount() < amount) {
                 // If we don't, log and track failed purchase
                 logger.info(String.format("Not enough inventory for SKU %s. Current inventory: %d, requested amount: %d", sku, currentInventory.getCount(), amount));
-                failedSkus.add(sku);
+                notEnoughSkus.put(sku, currentInventory.getCount());
             } else {
                 // If we do, decrement inventory and track successful purchase
                 currentInventory.setCount(currentInventory.getCount() - amount);
                 inventoryRepository.save(currentInventory);
-                successSkus.add(sku);
+                successSkus.put(sku, amount);
                 logger.info(String.format("Successfully purchased %d of SKU %s", amount, sku));
             }
         } else {
             // If we don't have any inventory for the SKU being purchased, return an error message
             logger.info(String.format("We don't have any records for SKU %s, please check the SKU and try again", sku));
-            failedSkus.add(sku);
+            missingSkus.add(sku);
         }
     }
 
     /**
      * Helper method to create purchase response message based on which SKUs were successfully purchased and which were not
-     * @param successSkus: List of SKUs that were successfully purchased
-     * @param failedSkus: List of SKUs that were not successfully purchased
+     * @param successSkus: Map of SKUs that were successfully purchased and how much
+     * @param notEnoughSkus: Map of SKUs that were not enough in inventory and how much inventory is left
+     * @param missingSkus: List of SKUs that were not found in inventory
      * @return ResponseEntity with appropriate message and status code based on which SKUs were successfully purchased and which were not
      */
-    protected ResponseEntity<String> makePurchaseResponse(List<String> successSkus, List<String> failedSkus) {
+    protected ResponseEntity<String> makePurchaseResponse(Map<String, Integer> successSkus, Map<String, Integer> notEnoughSkus, List<String> missingSkus) {
         // If all purchases were successful
-        if (failedSkus.isEmpty()) {
-            String returnMsg = String.format("Successfully purchased the following items: %s.", successSkus);
+        String returnMsg;
+        if (notEnoughSkus.isEmpty() && missingSkus.isEmpty()) {
+            returnMsg = "Successfully purchased the following items:\n";
+            for (String sku : successSkus.keySet()) {
+                returnMsg += String.format("- SKU: %s, Purchased Count: %d\n", sku, successSkus.get(sku));
+            }
             return new ResponseEntity<>(returnMsg, OK);
         }
         // If all purchases were unsuccessful 
         else if (successSkus.isEmpty()) {
-            String returnMsg = String.format("Could not purchase any of the items requested due to insufficient inventory or invalid SKU: %s.", failedSkus);
-            return new ResponseEntity<>(returnMsg, BAD_REQUEST);
+            returnMsg = "Could not purchase any of the items requested. due to insufficient inventory or invalid SKU.\n";
+            returnMsg += "Not enough inventory for the following SKUs:\n";
+            for (String sku : notEnoughSkus.keySet()) {
+                returnMsg += String.format("- SKU: %s, Remaining Amount: %d\n", sku, notEnoughSkus.get(sku));
+            }
+            returnMsg += "SKUs not present in our system:\n";
+            for (String sku : missingSkus) {
+                returnMsg += String.format("- SKU: %s\n", sku);
+            }
+            return new ResponseEntity<>(returnMsg, OK);
         } 
         // Mixed success and failure case
         else {
-            String returnMsg = String.format("Successfully purchased the following items: %s. Could not purchase the following items due to insufficient inventory or invalid SKU: %s.", successSkus, failedSkus);
-            return new ResponseEntity<>(returnMsg, BAD_REQUEST);
+            returnMsg = "Successfully purchased the following items:\n";
+            for (String sku : successSkus.keySet()) {
+                returnMsg += String.format("- SKU: %s, Purchased Count: %d\n", sku, successSkus.get(sku));
+            }
+            if (!notEnoughSkus.isEmpty()) {
+                returnMsg += "Not enough inventory for the following SKUs:\n";
+                for (String sku : notEnoughSkus.keySet()) {
+                    returnMsg += String.format("- SKU: %s, Remaining Amount: %d\n", sku, notEnoughSkus.get(sku));
+                }
+            }
+            if (!missingSkus.isEmpty()) {
+                returnMsg += "SKUs not present in our system:\n";
+                for (String sku : missingSkus) {
+                    returnMsg += String.format("- SKU: %s\n", sku);
+                }
+            }
+            return new ResponseEntity<>(returnMsg, OK);
         }
     }
 
@@ -221,9 +264,9 @@ public class Controller {
      * From a business perspective, we want to understand what our customers like and don't like. We want to get a list
      * of favorite items ranked by how many were purchased.
      *
-     * @param filter most|least
+     * @param filter most|least|both - whether to return the most popular items, least popular items, or both
      * @param count  number of items to return
-     * @return A list of favorite items
+     * @return A list of most and/or least favorite items
      */
     @GetMapping("/favorites")
     public ResponseEntity<?> favorites(
@@ -231,28 +274,58 @@ public class Controller {
         @RequestParam("count") int count
     ) {
         logger.info(String.format("Received request for the %s popular %d items", filter, count));
-        List<Favorites> favorites = new ArrayList<>();
-        // If the filter is "most", return the most popular items.
-        if(filter.equals("most")) {
-            favorites = favoritesRepository.findAllByOrderByCountDesc();
-        }
-        // If the filter is "least", return the least popular items. 
-        else if(filter.equals("least")) {
-            favorites = favoritesRepository.findAllByOrderByCountAsc();
-        } 
-        // If the filter is anything else, return an error message.
-        else {
-            return new ResponseEntity<>("To get the most popular items, use filter=most. To get the least popular items, use filter=least, please try again.", BAD_REQUEST);
-        }
-        logger.info(String.format("Getting the %s popular %d items:", filter, count));
-
-        // if requesting more items than in favorites table, return all items in favorites table
-        if(count > favorites.size()) {
-            count = favorites.size();
+        // Handle bad count request
+        if(count == 0) {
+            return new ResponseEntity<>("Requested count must be greater than 0", BAD_REQUEST);
         }
 
-        // Return the requested number of items based on filter
-        List<Favorites> requestFavorites = favorites.subList(0, count);
-        return new ResponseEntity<>(requestFavorites.toString(), OK); 
+        String responseMsg = "";
+        // Check if reqesting more than we have, if yes return all that we have
+        if(count > favoritesRepository.count()) {
+            logger.info("Requested count larger than favorites table size, returning all items in favorites table");
+            responseMsg += String.format("Requested count larger than table, returning all %d items.\n", favoritesRepository.count());
+            count = (int) favoritesRepository.count();
+        }
+    
+        if(filter.equals("both") || (!filter.equals("most") && !filter.equals("least"))) {
+            // Handle bad filter request by leveraging default behavoir 
+            if(!filter.equals("both")) {
+                logger.info("Invalid filter provided, defaulting to returning both most and least items in favorites table");
+                responseMsg += "Invalid filter (accepted values: most/least/both), defaulting to returning both most and least popular items.\n";
+            }
+            logger.info("Returning both most and least %d items in favorites table", count);
+            List<Favorites> mostFavorites = favoritesRepository.findAllByOrderByCountDesc();
+            List<Favorites> leastFavorites = favoritesRepository.findAllByOrderByCountAsc();
+            responseMsg += String.format("Here are the most popular %d items:", count);
+            for(int i = 0; i < mostFavorites.size(); i++) {
+                responseMsg += String.format("\n%d. SKU: %s, Total: %d", i+1, mostFavorites.get(i).getSku(), mostFavorites.get(i).getCount());
+            }
+            responseMsg += String.format("\nHere are the least popular %d items:", count);
+            for(int i = 0; i < leastFavorites.size(); i++) {
+                responseMsg += String.format("\n%d. SKU: %s, Total: %d", i+1, leastFavorites.get(i).getSku(), leastFavorites.get(i).getCount());
+            }
+            return new ResponseEntity<>(responseMsg, OK);
+        }
+        // Handle specific 'most' or 'least' filter request
+        else{
+            List<Favorites> favorites = new ArrayList<>();
+            // If the filter is "most", return the most popular items.
+            if(filter.equals("most")) {
+                favorites = favoritesRepository.findAllByOrderByCountDesc();
+            }
+            // If the filter is "least", return the least popular items. 
+            else {
+                favorites = favoritesRepository.findAllByOrderByCountAsc();
+            } 
+            logger.info(String.format("Getting the %s popular %d items:", filter, count));
+
+            // Return the requested number of items based on filter
+            List<Favorites> requestFavorites = favorites.subList(0, count);
+            responseMsg += String.format("Here are the %s popular %d items:", filter, count);
+            for(int i = 0; i < requestFavorites.size(); i++) {
+                responseMsg += String.format("\n%d. SKU: %s, Total: %d", i+1, requestFavorites.get(i).getSku(), requestFavorites.get(i).getCount());
+            }
+        }
+        return new ResponseEntity<>(responseMsg, OK); 
     }
 }
